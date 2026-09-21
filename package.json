@@ -1,0 +1,16 @@
+{
+  "name": "dinodia-alexa-skill-v2",
+  "version": "1.0.0",
+  "private": true,
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "test": "npm run build && node --test test/*.test.js",
+    "clean": "rm -rf dist",
+    "prepare-zip": "npm run clean && npm run build && cd dist && zip -r ../dinodia-alexa-skill.zip ."
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.0",
+    "typescript": "^5.6.0"
+  }
+}
