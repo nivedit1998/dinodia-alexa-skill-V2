@@ -1,0 +1,37 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const { decodeNativeAlexaDevices, alexaEndpointId } = require('../dist/dinodiaV1.js');
+const root = path.join(__dirname, 'fixtures/dinodia-v1');
+const fixture = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/multi-control-device.json'), 'utf8'));
+const context = { homeId: fixture.context.homeId, homeMembershipId: fixture.context.homeMembershipId, role: 'OWNER', authorisedAreaIds: ['area:living'] };
+test('Alexa contract adapter rejects wrong version/home and private tenant devices while omitting app-only controls', () => {
+  const projected = decodeNativeAlexaDevices({ schemaVersion: 'dinodia.v1', homeId: context.homeId, data: [fixture.device] }, context);
+  assert.equal(projected?.length, 1);
+  assert.equal(projected[0].controls.some((control) => control.confirmationPolicy === 'step_up'), false);
+  assert.equal(decodeNativeAlexaDevices({ schemaVersion: 'dinodia.v0', homeId: context.homeId, data: [] }, context), null);
+  assert.equal(decodeNativeAlexaDevices({ schemaVersion: 'dinodia.v1', homeId: 'home:other', data: [] }, context), null);
+  const safe = { ...fixture.device, controls: fixture.device.controls.slice(0, 2) };
+  assert.equal(decodeNativeAlexaDevices({ schemaVersion: 'dinodia.v1', homeId: context.homeId, data: [safe] }, context)?.length, 1);
+  const ownPrivate = { ...safe, managementClass: 'tenant_device', ownerMembershipId: 'membership:tenant-a' };
+  const tenantContext = { ...context, role: 'TENANT', homeMembershipId: 'membership:tenant-a' };
+  assert.equal(decodeNativeAlexaDevices({ schemaVersion: 'dinodia.v1', homeId: context.homeId, data: [ownPrivate] }, tenantContext)?.length, 1);
+  assert.deepEqual(decodeNativeAlexaDevices({ schemaVersion: 'dinodia.v1', homeId: context.homeId, data: [ownPrivate] }, context), []);
+  assert.deepEqual(decodeNativeAlexaDevices({ schemaVersion: 'dinodia.v1', homeId: context.homeId, data: [{ ...ownPrivate, ownerMembershipId: 'membership:tenant-b' }] }, tenantContext), []);
+  const forgedLock = { ...safe, controls: [{ ...fixture.device.controls.find((control) => control.controlId === 'control:lock'), automatable: true, stepUpPolicy: 'none', confirmationPolicy: 'none' }] };
+  assert.equal(decodeNativeAlexaDevices({ schemaVersion: 'dinodia.v1', homeId: context.homeId, data: [forgedLock] }, context), null);
+  assert.equal(decodeNativeAlexaDevices({ schemaVersion: 'dinodia.v1', homeId: context.homeId, data: [{ ...safe, entity_id: 'light.private' }] }, context), null);
+});
+test('Alexa endpoint identity is opaque and home-scoped', () => assert.notEqual(alexaEndpointId('home:a', 'device:x'), alexaEndpointId('home:b', 'device:x')));
+test('Alexa rejects malformed bounds, duplicate controls and unattended step-up controls', () => {
+  const safe = { ...fixture.device, controls: fixture.device.controls.slice(0, 2) };
+  const decode = (device) => decodeNativeAlexaDevices({ schemaVersion: 'dinodia.v1', homeId: context.homeId, data: [device] }, context);
+  assert.equal(decode({ ...safe, controls: [{ ...safe.controls[0], constraints: { minimum: 100, maximum: 10 } }, safe.controls[1] ] }), null);
+  assert.equal(decode({ ...safe, controls: [{ ...safe.controls[0], constraints: { minimum: 0, maximum: 100, step: 0 } }, safe.controls[1] ] }), null);
+  assert.equal(decode({ ...safe, controls: [{ ...safe.controls[0], constraints: { precision: 13 } }, safe.controls[1] ] }), null);
+  assert.equal(decode({ ...safe, controls: [{ ...safe.controls[0], constraints: { options: [{ value: 'x', label: 'X', adminOnly: true }] } }, safe.controls[1] ] }), null);
+  assert.equal(decode({ ...safe, controls: [{ ...safe.controls[0], valueType: 'option', interactionKind: 'picker', constraints: { options: [] } }, safe.controls[1] ] }), null);
+  assert.equal(decode({ ...safe, controls: [{ ...safe.controls[0], stepUpPolicy: 'required', automatable: true }, safe.controls[1] ] }), null);
+  assert.equal(decode({ ...safe, controls: [safe.controls[0], safe.controls[0]] }), null);
+});
