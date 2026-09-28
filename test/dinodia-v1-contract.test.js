@@ -24,6 +24,33 @@ test('Alexa contract adapter rejects wrong version/home and private tenant devic
   assert.equal(decodeNativeAlexaDevices({ schemaVersion: 'dinodia.v1', homeId: context.homeId, data: [{ ...safe, entity_id: 'light.private' }] }, context), null);
 });
 test('Alexa endpoint identity is opaque and home-scoped', () => assert.notEqual(alexaEndpointId('home:a', 'device:x'), alexaEndpointId('home:b', 'device:x')));
+test('Alexa package carries the shared lifecycle and privacy decision fixture', () => {
+  const decisions = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/stage2-decision-matrix.json'), 'utf8'));
+  assert.equal(decisions.schemaVersion, 'dinodia.v1');
+  assert.equal(decisions.controls.securityControlAlexaExposed, false);
+  assert.equal(decisions.notification.tenantDeviceAudience, 'owning_membership_only');
+  assert.equal(decisions.tenantPrivacy.ownerCanRead, false);
+  assert.equal(decisions.replacement.nameBasedMergeAllowed, false);
+  assert.equal(decisions.automation.saveRequiresCurrentRevision, true);
+  assert.equal(decisions.automation.staleRevisionIsRejectedWithoutMerge, true);
+  assert.equal(decisions.automation.presentationLabelsGrantCapability, false);
+  assert.equal(decisions.alexa.activeMembershipRole, 'TENANT');
+  assert.equal(decisions.alexa.selectedAreaIdsAreAuthoritative, true);
+  assert.equal(decisions.alexa.ownTenantDeviceEligible, true);
+  assert.equal(decisions.alexa.otherTenantDeviceEligible, false);
+  assert.equal(decisions.alexa.appOnlySecurityControlEligible, false);
+  assert.equal(decisions.trustedDevice.removalRevokesAccountInstallation, true);
+  assert.equal(decisions.trustedDevice.offlineReenrollmentAllowed, false);
+  assert.equal(decisions.provisioning.cloudUrlIndependentlyVerified, true);
+  assert.equal(decisions.provisioning.manufacturingRootPrivateKeyOnHub, false);
+  assert.equal(decisions.roomQr.claimReservationFirstWins, true);
+  assert.deepEqual(decisions.support.categories, ['ACCOUNT_OR_SIGN_IN', 'ACCESS_OR_PERMISSIONS', 'DEVICE_PROBLEM', 'HUB_OR_CONNECTION', 'AUTOMATION', 'ALEXA', 'OTHER']);
+  assert.equal(decisions.support.privateTenantDeviceTicketVisibleToOwner, false);
+  assert.equal(decisions.support.infrastructureNoticeContainsTenantPrivateDetails, false);
+  assert.deepEqual(decisions.notifications.channels, ['push', 'verified_email']);
+  assert.equal(decisions.notifications.deliveryReceiptGrantsAuthority, false);
+  assert.equal(decisions.offline.policyAppliedBeforeConnected, true);
+});
 test('Alexa rejects malformed bounds, duplicate controls and unattended step-up controls', () => {
   const safe = { ...fixture.device, controls: fixture.device.controls.slice(0, 2) };
   const decode = (device) => decodeNativeAlexaDevices({ schemaVersion: 'dinodia.v1', homeId: context.homeId, data: [device] }, context);
