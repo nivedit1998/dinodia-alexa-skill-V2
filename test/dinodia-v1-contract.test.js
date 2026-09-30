@@ -76,7 +76,7 @@ test('Alexa keeps unknown interactions non-authoritative and rejects commandable
   assert.equal(decodeNativeAlexaDevices(catalog([unsafeUnknown]), context), null, unknownMutation.expected);
 
   const mutation = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/invalid/writable-unreadable-control.json'), 'utf8'));
-  const source = JSON.parse(fs.readFileSync(path.join(root, 'fixtures', mutation.sourceFixture.replace(/^fixtures\//, '')), 'utf8'));
+  const source = JSON.parse(fs.readFileSync(path.join(root, mutation.sourceFixture), 'utf8'));
   const device = structuredClone(source.device);
   const control = device.controls.find((candidate) => candidate.controlId === mutation.mutation.controlId);
   Object.assign(control, mutation.mutation);
@@ -91,6 +91,26 @@ test('Alexa rejects malformed canonical envelope metadata and extra authority fi
     { ...payload, authority: 'forged' },
     { ...payload, generatedAt: '2099-01-01T00:00:00Z' },
   ]) assert.equal(decodeNativeAlexaDevices(malformed, context), null);
+  const impossibleDate = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/invalid/impossible-calendar-date-envelope.json'), 'utf8'));
+  assert.equal(decodeNativeAlexaDevices(impossibleDate, context), null, 'calendar-invalid dates must not pass because Date.parse normalizes them');
+});
+test('Alexa rejects a descriptor that omits required stepUpPolicy before projection', () => {
+  const mutation = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/invalid/device-missing-step-up-policy.json'), 'utf8'));
+  const source = JSON.parse(fs.readFileSync(path.join(root, 'fixtures', mutation.sourceFixture.replace(/^fixtures\//, '')), 'utf8'));
+  const device = structuredClone(source.device);
+  const control = device.controls.find((item) => item.controlId === mutation.controlId);
+  assert.ok(control);
+  delete control[mutation.removeField];
+  assert.equal(decodeNativeAlexaDevices(catalog([device]), context), null);
+});
+test('Alexa rejects a descriptor with a noncanonical stepUpPolicy before projection', () => {
+  const mutation = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/invalid/device-invalid-step-up-policy.json'), 'utf8'));
+  const source = JSON.parse(fs.readFileSync(path.join(root, mutation.sourceFixture), 'utf8'));
+  const device = structuredClone(source.device);
+  const control = device.controls.find((item) => item.controlId === mutation.controlId);
+  assert.ok(control);
+  control[mutation.field] = mutation.invalidValue;
+  assert.equal(decodeNativeAlexaDevices(catalog([device]), context), null);
 });
 test('Alexa enforces code-point label limits and rejects duplicate device identities', () => {
   const labels = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/customer-label-unicode-boundaries.json'), 'utf8'));

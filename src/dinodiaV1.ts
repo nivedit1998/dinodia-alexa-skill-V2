@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 
-export interface NativeControlV1 { schemaVersion: number; deviceId: string; surfaceId?: string|null; controlId: string; label: string; group?: string|null; valueType: 'boolean'|'number'|'option'|'text'|'invoke'; interactionKind: string; semanticRole: string; readable: boolean; writable: boolean; automatable: boolean; observable: boolean; idempotency: string; confirmationPolicy: string; riskLevel: string; stepUpPolicy?: string; unsupportedReason?: string|null; sortOrder: number; catalogRevision: number; expectedReportingIntervalSeconds?: number; maxStateValiditySeconds?: number; constraints?: { minimum?: number; maximum?: number; step?: number; precision?: number; unit?: string; options?: Array<{ value: unknown; label: string }> } }
+export interface NativeControlV1 { schemaVersion: number; deviceId: string; surfaceId?: string|null; controlId: string; label: string; group?: string|null; valueType: 'boolean'|'number'|'option'|'text'|'invoke'; interactionKind: string; semanticRole: string; readable: boolean; writable: boolean; automatable: boolean; observable: boolean; idempotency: string; confirmationPolicy: string; riskLevel: string; stepUpPolicy: string; unsupportedReason?: string|null; sortOrder: number; catalogRevision: number; expectedReportingIntervalSeconds?: number; maxStateValiditySeconds?: number; constraints?: { minimum?: number; maximum?: number; step?: number; precision?: number; unit?: string; options?: Array<{ value: unknown; label: string }> } }
 export interface NativeDeviceV1 { id: string; homeId: string; managementClass: 'property_device'|'tenant_device'; ownerMembershipId: string|null; lifecycle: 'commissioning'|'installed'|'view_only'|'retired'; technicalLabel: string; customerLabel: string|null; areaIds: string[]; controls: NativeControlV1[]; descriptorRevision: number }
 export interface NativeAlexaContextV1 { homeId: string; homeMembershipId: string; role: 'OWNER'|'PROPERTY_MANAGER'|'TENANT'; authorisedAreaIds: string[] }
 export interface NativeAlexaDiscoveryV1 { homeId: string; homeMembershipId: string; selectedAreaIds: string[]; exposureGeneration: number; devices: NativeDeviceV1[] }
@@ -9,7 +9,18 @@ const semanticRoles = new Set(['power','brightness','active_heat_demand','active
 const approvedAlexaRoles = new Set(['power','brightness','target_temperature','ambient_temperature','opening_percentage','position','volume']);
 const codePointLength = (value: string): number => Array.from(value).length;
 const validOpaqueId = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0 && codePointLength(value) <= 160;
-const isUtcTimestamp = (value: unknown): value is string => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(value) && Number.isFinite(Date.parse(value));
+const isUtcTimestamp = (value: unknown): value is string => {
+  if (typeof value !== 'string') return false;
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?Z$/.exec(value);
+  if (!match) return false;
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText] = match;
+  const year = Number(yearText); const month = Number(monthText); const day = Number(dayText);
+  const hour = Number(hourText); const minute = Number(minuteText); const second = Number(secondText);
+  if (month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59) return false;
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+  return day >= 1 && day <= daysInMonth && Number.isFinite(Date.parse(value));
+};
 function validControl(control: NativeControlV1, device: NativeDeviceV1): boolean {
   if (!control || typeof control !== 'object' || !Object.prototype.hasOwnProperty.call(control, 'schemaVersion') || control.deviceId !== device.id || control.schemaVersion !== 1 ||
       typeof control.controlId !== 'string' || !control.controlId || typeof control.label !== 'string' || !control.label.trim() || codePointLength(control.label) > 80 ||
@@ -19,7 +30,7 @@ function validControl(control: NativeControlV1, device: NativeDeviceV1): boolean
       !validOpaqueId(control.controlId) || codePointLength(control.label) > 80 || !(control.unsupportedReason == null || typeof control.unsupportedReason === 'string' && codePointLength(control.unsupportedReason) <= 120) ||
       !['set_value','invoke_once','none'].includes(control.idempotency) || !['none','matching_observation','explicit_user','step_up'].includes(control.confirmationPolicy) ||
       !['low','normal','sensitive','critical'].includes(control.riskLevel) ||
-      !['none','required'].includes(control.stepUpPolicy ?? 'none') || typeof control.readable !== 'boolean' || typeof control.writable !== 'boolean' ||
+      !['none','required'].includes(control.stepUpPolicy) || typeof control.readable !== 'boolean' || typeof control.writable !== 'boolean' ||
       typeof control.automatable !== 'boolean' || typeof control.observable !== 'boolean' || (control.writable && !control.readable) ||
       (!interactionKinds.has(control.interactionKind) && (control.writable || control.automatable || control.idempotency !== 'none' || control.confirmationPolicy !== 'none' || control.stepUpPolicy !== 'none')) ||
       (control.valueType === 'option' && control.writable && (!Array.isArray(control.constraints?.options) || control.constraints.options.length === 0)) ||
