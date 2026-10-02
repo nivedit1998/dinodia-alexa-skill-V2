@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const { decodeNativeAlexaDevices, alexaEndpointId } = require('../dist/dinodiaV1.js');
+const { decodeNativeAlexaDevices, decodeNativeAlexaDiscovery, alexaEndpointId } = require('../dist/dinodiaV1.js');
 const root = path.join(__dirname, 'fixtures/dinodia-v1');
 const fixture = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/multi-control-device.json'), 'utf8'));
 const context = { homeId: fixture.context.homeId, homeMembershipId: fixture.context.homeMembershipId, role: 'OWNER', authorisedAreaIds: ['area:living'] };
@@ -25,6 +25,29 @@ test('Alexa contract adapter rejects wrong version/home and private tenant devic
   assert.equal(decodeNativeAlexaDevices(catalog([{ ...safe, entity_id: 'light.private' }]), context), null);
 });
 test('Alexa endpoint identity is opaque and home-scoped', () => assert.notEqual(alexaEndpointId('home:a', 'device:x'), alexaEndpointId('home:b', 'device:x')));
+test('Alexa discovery adapter applies selected membership, area exposure generation and app-only control exclusions', () => {
+  const source = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/alexa-discovery-projection.json'), 'utf8'));
+  const projection = decodeNativeAlexaDiscovery(source);
+  assert.ok(projection);
+  assert.equal(projection.homeId, source.homeId);
+  assert.equal(projection.homeMembershipId, source.membership.homeMembershipId);
+  assert.deepEqual(projection.selectedAreaIds, source.selectedAreaIds);
+  assert.equal(projection.exposureGeneration, source.exposureGeneration);
+  assert.equal(projection.devices.length, 1, 'tenant-owned device without exposed eligible controls is not projected');
+  assert.deepEqual(projection.devices[0].controls.map((control) => control.controlId), ['control:power', 'control:brightness']);
+  assert.equal(projection.devices[0].controls.some((control) => ['security_lock', 'lock_state'].includes(control.semanticRole)), false);
+
+  assert.equal(decodeNativeAlexaDiscovery({ ...source, membership: { ...source.membership, role: 'OWNER' } }), null);
+  assert.equal(decodeNativeAlexaDiscovery({ ...source, selectedAreaIds: ['area:bedroom'] }), null, 'device data outside the selected-area projection is rejected');
+  assert.equal(decodeNativeAlexaDiscovery({ ...source, exposureGeneration: -1 }), null);
+  assert.equal(decodeNativeAlexaDiscovery({ ...source, supportOverride: true }), null, 'unknown authority metadata is rejected');
+
+  const changedOwner = structuredClone(source);
+  changedOwner.data[1].ownerMembershipId = 'membership:tenant-b';
+  const privateProjection = decodeNativeAlexaDiscovery(changedOwner);
+  assert.ok(privateProjection);
+  assert.deepEqual(privateProjection.devices.map((device) => device.id), ['device:opaque-1'], 'a different tenant’s private device never crosses the projection');
+});
 test('Alexa package carries the shared lifecycle and privacy decision fixture', () => {
   const decisions = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/stage2-decision-matrix.json'), 'utf8'));
   assert.equal(decisions.schemaVersion, 'dinodia.v1');
@@ -63,6 +86,16 @@ test('Alexa rejects malformed bounds, duplicate controls and unattended step-up 
   assert.equal(decode({ ...safe, controls: [{ ...safe.controls[0], stepUpPolicy: 'required', automatable: true }, safe.controls[1] ] }), null);
   assert.equal(decode({ ...safe, controls: [safe.controls[0], safe.controls[0]] }), null);
   assert.equal(decode({ ...safe, controls: [{ ...safe.controls[0], readable: false }, safe.controls[1]] }), null, 'a writable descriptor cannot be unreadable');
+});
+test('Alexa consumes the shared duplicate-control-ID negative before capability projection', () => {
+  const mutation = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/invalid/duplicate-device-control-id.json'), 'utf8'));
+  const source = JSON.parse(fs.readFileSync(path.join(root, mutation.sourceFixture), 'utf8'));
+  const device = structuredClone(source.device);
+  const target = device.controls.find((control) => control.controlId === mutation.targetControlId);
+  assert.ok(target);
+  target.controlId = mutation.duplicateControlId;
+  assert.equal(mutation.expected, 'reject_descriptor_before_projection_or_dispatch');
+  assert.equal(decodeNativeAlexaDevices(catalog([device]), context), null);
 });
 test('Alexa keeps unknown interactions non-authoritative and rejects commandable unknown descriptors', () => {
   const unknown = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/unknown-interaction-kind.json'), 'utf8'));
