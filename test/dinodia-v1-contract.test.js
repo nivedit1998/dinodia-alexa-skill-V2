@@ -180,3 +180,144 @@ test('Alexa consumes shared Unicode-code-point descriptor bounds without changin
     }
   }
 });
+
+test('Alexa executes every indexed connection fixture through its decoder or exposure projection', () => {
+  const index = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/index.json'), 'utf8'));
+  const references = index.screenFixtures['tenant.alexa.connection'];
+  assert.deepEqual(references, [
+    'fixtures/alexa-discovery-projection.json',
+    'fixtures/invalid/device-missing-step-up-policy.json',
+    'fixtures/invalid/device-invalid-step-up-policy.json',
+    'fixtures/invalid/writable-unreadable-control.json',
+    'fixtures/invalid/unknown-interaction-commandable.json',
+    'fixtures/invalid/duplicate-device-control-id.json',
+    'fixtures/invalid/tenant-device-wrong-owner.json',
+    'fixtures/invalid/impossible-calendar-date-envelope.json',
+    'fixtures/unknown-interaction-kind.json',
+    'fixtures/stage2-decision-matrix.json',
+  ], 'Every indexed Alexa fixture must have an explicit executable owner below');
+
+  const read = (reference) => JSON.parse(fs.readFileSync(path.join(root, reference), 'utf8'));
+  const source = read('fixtures/multi-control-device.json');
+  const tenantContext = { ...context, role: 'TENANT', homeMembershipId: 'membership:tenant-a', authorisedAreaIds: ['area:living'] };
+  const setControlMutation = (device, fixture, mutation) => {
+    const control = device.controls.find((item) => item.controlId === fixture.controlId);
+    assert.ok(control, `Fixture control ${fixture.controlId} must exist in its declared source`);
+    mutation(control, fixture);
+  };
+
+  for (const reference of references) {
+    switch (reference) {
+      case 'fixtures/alexa-discovery-projection.json': {
+        const fixture = read(reference);
+        const projection = decodeNativeAlexaDiscovery(fixture);
+        assert.ok(projection, 'valid selected-membership Alexa projection decodes');
+        assert.equal(projection.homeId, fixture.homeId);
+        assert.equal(projection.homeMembershipId, fixture.membership.homeMembershipId);
+        assert.deepEqual(projection.selectedAreaIds, fixture.selectedAreaIds);
+        assert.equal(projection.exposureGeneration, fixture.exposureGeneration);
+        assert.deepEqual(projection.devices.flatMap((device) => device.controls.map((control) => control.controlId)), ['control:power', 'control:brightness']);
+        break;
+      }
+      case 'fixtures/invalid/device-missing-step-up-policy.json':
+      case 'fixtures/invalid/device-invalid-step-up-policy.json': {
+        const fixture = read(reference);
+        const sourceFixture = read(fixture.sourceFixture);
+        const device = structuredClone(sourceFixture.device);
+        setControlMutation(device, fixture, (control) => {
+          if (fixture.removeField) delete control[fixture.removeField];
+          else control[fixture.field] = fixture.invalidValue;
+        });
+        assert.equal(decodeNativeAlexaDevices(catalog([device]), context), null, fixture.expectedOutcome);
+        break;
+      }
+      case 'fixtures/invalid/writable-unreadable-control.json': {
+        const fixture = read(reference);
+        const sourceFixture = read(fixture.sourceFixture);
+        const device = structuredClone(sourceFixture.device);
+        const mutation = fixture.mutation;
+        setControlMutation(device, mutation, (control) => Object.assign(control, mutation));
+        assert.equal(decodeNativeAlexaDevices(catalog([device]), context), null, fixture.expectedOutcome);
+        break;
+      }
+      case 'fixtures/invalid/unknown-interaction-commandable.json': {
+        const fixture = read(reference);
+        const sourceFixture = read(fixture.sourceFixture);
+        const device = structuredClone(sourceFixture.device);
+        device.lifecycle = 'installed';
+        setControlMutation(device, fixture, (control) => Object.assign(control, fixture.mutation));
+        assert.equal(decodeNativeAlexaDevices(catalog([device]), { ...context, authorisedAreaIds: device.areaIds }), null, fixture.expected);
+        break;
+      }
+      case 'fixtures/invalid/duplicate-device-control-id.json': {
+        const fixture = read(reference);
+        const sourceFixture = read(fixture.sourceFixture);
+        const device = structuredClone(sourceFixture.device);
+        const duplicate = device.controls.find((control) => control.controlId === fixture.targetControlId);
+        assert.ok(duplicate);
+        duplicate.controlId = fixture.duplicateControlId;
+        assert.equal(decodeNativeAlexaDevices(catalog([device]), context), null, fixture.expected);
+        break;
+      }
+      case 'fixtures/invalid/tenant-device-wrong-owner.json': {
+        const fixture = read(reference);
+        assert.deepEqual(
+          decodeNativeAlexaDevices(catalog([fixture.device]), { ...tenantContext, authorisedAreaIds: fixture.device.areaIds }),
+          [],
+          'another tenant’s private device is omitted before capability projection',
+        );
+        break;
+      }
+      case 'fixtures/invalid/impossible-calendar-date-envelope.json':
+        assert.equal(decodeNativeAlexaDevices(read(reference), context), null, 'impossible UTC calendar date is rejected by the Alexa decoder');
+        break;
+      case 'fixtures/unknown-interaction-kind.json': {
+        const fixture = read(reference);
+        const device = { ...fixture.device, lifecycle: 'installed' };
+        assert.deepEqual(
+          decodeNativeAlexaDevices(catalog([device]), { ...context, authorisedAreaIds: device.areaIds }),
+          [],
+          'unknown interaction remains valid but safe and unexposed',
+        );
+        break;
+      }
+      case 'fixtures/stage2-decision-matrix.json': {
+        const policy = read(reference);
+        const projectionFixture = read('fixtures/alexa-discovery-projection.json');
+        assert.equal(policy.alexa.activeMembershipRole, 'TENANT');
+        const projection = decodeNativeAlexaDiscovery(projectionFixture);
+        assert.ok(projection);
+        assert.equal(projection.homeMembershipId, 'membership:tenant-a');
+        assert.equal(projection.devices.some((device) => device.controls.some((control) => ['security_lock', 'lock_state'].includes(control.semanticRole))), false);
+
+        const tenantOwned = structuredClone(source.device);
+        tenantOwned.managementClass = 'tenant_device';
+        tenantOwned.ownerMembershipId = tenantContext.homeMembershipId;
+        tenantOwned.areaIds = ['area:living'];
+        const ownTenantProjection = decodeNativeAlexaDevices(catalog([tenantOwned]), tenantContext);
+        assert.equal(policy.alexa.ownTenantDeviceEligible, true);
+        assert.equal(ownTenantProjection?.length, 1, 'the owning tenant can expose supported controls');
+        assert.deepEqual(
+          decodeNativeAlexaDevices(catalog([tenantOwned]), { ...tenantContext, homeMembershipId: 'membership:tenant-b' }),
+          [],
+          'a different tenant cannot expose this tenant-owned device',
+        );
+
+        const lock = tenantOwned.controls.find((control) => control.semanticRole === 'security_lock');
+        assert.ok(lock);
+        lock.label = 'Brightness';
+        const labelOnlyLock = decodeNativeAlexaDevices(catalog([tenantOwned]), tenantContext);
+        assert.equal(policy.controls.labelCanCreateCapability, false);
+        assert.equal(policy.alexa.appOnlySecurityControlEligible, false);
+        assert.equal(labelOnlyLock?.[0]?.controls.some((control) => control.controlId === lock.controlId), false, 'presentation labels do not expose app-only locks');
+
+        const wrongAreaProjection = decodeNativeAlexaDiscovery({ ...projectionFixture, selectedAreaIds: ['area:bedroom'] });
+        assert.equal(wrongAreaProjection, null, 'selected areas are authority, not presentation metadata');
+        assert.equal(decodeNativeAlexaDiscovery({ ...projectionFixture, exposureGeneration: -1 }), null);
+        break;
+      }
+      default:
+        assert.fail(`No Alexa consumer execution is registered for indexed fixture ${reference}`);
+    }
+  }
+});
