@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { decodeNativeAlexaDiscovery, type NativeAlexaDiscoveredDeviceV1, type NativeControlV1 } from './dinodiaV1';
 
 type AlexaHeader = { namespace: string; name: string; messageId: string; correlationToken?: string; payloadVersion: string };
@@ -48,25 +48,36 @@ function isNativeEndpointId(value: unknown): value is string { return typeof val
 function supportedInterfaces(device: NativeAlexaDiscoveredDeviceV1): object[] {
   const controls = device.controls.filter((control) => control.writable && control.readable && control.automatable && control.stepUpPolicy !== 'required');
   const result: object[] = [
-    { interface: 'Alexa', version: '3' },
-    { interface: 'Alexa.EndpointHealth', version: '3', properties: { proactivelyReported: true, retrievable: true, supported: [{ name: 'connectivity' }] } },
+    { type: 'AlexaInterface', interface: 'Alexa', version: '3' },
+    { type: 'AlexaInterface', interface: 'Alexa.EndpointHealth', version: '3', properties: { proactivelyReported: true, retrievable: true, supported: [{ name: 'connectivity' }] } },
   ];
   if (controls.some((control) => control.semanticRole === 'power' && control.valueType === 'boolean')) {
-    result.push({ interface: 'Alexa.PowerController', version: '3', properties: { proactivelyReported: true, retrievable: true, supported: [{ name: 'powerState' }] } });
+    result.push({ type: 'AlexaInterface', interface: 'Alexa.PowerController', version: '3', properties: { proactivelyReported: true, retrievable: true, supported: [{ name: 'powerState' }] } });
   }
   if (controls.some((control) => control.semanticRole === 'brightness' && control.valueType === 'number')) {
-    result.push({ interface: 'Alexa.BrightnessController', version: '3', properties: { proactivelyReported: true, retrievable: true, supported: [{ name: 'brightness' }] } });
+    result.push({ type: 'AlexaInterface', interface: 'Alexa.BrightnessController', version: '3', properties: { proactivelyReported: true, retrievable: true, supported: [{ name: 'brightness' }] } });
   }
   if (controls.some((control) => control.semanticRole === 'target_temperature' && control.valueType === 'number')) {
-    result.push({ interface: 'Alexa.ThermostatController', version: '3', properties: { proactivelyReported: true, retrievable: true, supported: [{ name: 'targetSetpoint' }] }, configuration: { supportedModes: [{ value: 'HEAT' }] } });
+    result.push({ type: 'AlexaInterface', interface: 'Alexa.ThermostatController', version: '3', properties: { proactivelyReported: true, retrievable: true, supported: [{ name: 'targetSetpoint' }] }, configuration: { supportedModes: [{ value: 'HEAT' }] } });
   }
   if (device.controls.some((control) => control.semanticRole === 'ambient_temperature' && control.readable && control.observable && !control.writable)) {
-    result.push({ interface: 'Alexa.TemperatureSensor', version: '3', properties: { proactivelyReported: true, retrievable: true, supported: [{ name: 'temperature' }] } });
+    result.push({ type: 'AlexaInterface', interface: 'Alexa.TemperatureSensor', version: '3', properties: { proactivelyReported: true, retrievable: true, supported: [{ name: 'temperature' }] } });
   }
-  const position = controls.find((control) => ['opening_percentage', 'position'].includes(control.semanticRole) && control.valueType === 'number' && validRange(control));
-  if (position) {
-    const bounds = position.constraints!;
-    result.push({ interface: 'Alexa.RangeController', version: '3', instance: 'Dinodia.Position', capabilityResources: { friendlyNames: [{ '@type': 'text', value: { text: position.label, locale: 'en-GB' } }] }, properties: { proactivelyReported: true, retrievable: true, supported: [{ name: 'rangeValue' }] }, configuration: { supportedRange: { minimumValue: bounds.minimum, maximumValue: bounds.maximum, precision: bounds.step } }, semantics: { actionMappings: [], stateMappings: [] }, unitOfMeasure: 'Alexa.Unit.Percent' });
+  const rangeControls = controls.filter((control) => ['opening_percentage', 'position'].includes(control.semanticRole)
+    && control.valueType === 'number' && validRange(control));
+  const roleCounts = new Map<string, number>();
+  for (const control of rangeControls) roleCounts.set(control.semanticRole, (roleCounts.get(control.semanticRole) ?? 0) + 1);
+  for (const control of rangeControls) {
+    const bounds = control.constraints!;
+    const base = control.semanticRole === 'position' ? 'Dinodia.Position' : 'Dinodia.OpeningPercentage';
+    const instance = roleCounts.get(control.semanticRole) === 1
+      ? base
+      : `${base}.${createHash('sha256').update(control.controlId, 'utf8').digest('base64url')}`;
+    result.push({ type: 'AlexaInterface', interface: 'Alexa.RangeController', version: '3', instance,
+      capabilityResources: { friendlyNames: [{ '@type': 'text', value: { text: control.label, locale: 'en-GB' } }] },
+      properties: { proactivelyReported: true, retrievable: true, supported: [{ name: 'rangeValue' }] },
+      configuration: { supportedRange: { minimumValue: bounds.minimum, maximumValue: bounds.maximum, precision: bounds.step }, unitOfMeasure: bounds.unit === 'percent' ? 'Alexa.Unit.Percent' : undefined },
+    });
   }
   return result;
 }

@@ -15,9 +15,21 @@ function directive(namespace, name, endpointId) {
   };
 }
 
+function rangeControl(device, controlId, sortOrder = 3) {
+  return {
+    schemaVersion: 1, deviceId: device.id, controlId, label: 'Position', group: 'Blind', sortOrder,
+    valueType: 'number', interactionKind: 'slider', semanticRole: 'position', readable: true, writable: true,
+    automatable: true, observable: true, idempotency: 'set_value', confirmationPolicy: 'matching_observation',
+    riskLevel: 'normal', stepUpPolicy: 'none', catalogRevision: device.descriptorRevision,
+    expectedReportingIntervalSeconds: 60, maxStateValiditySeconds: 180,
+    constraints: { minimum: 0, maximum: 100, step: 5, unit: 'percent' }, unsupportedReason: null,
+  };
+}
+
 test('Alexa discovery uses the native Dinodia OS projection when available', async () => {
   const calls = [];
-  const nativeResponse = discoveryFixture;
+  const nativeResponse = structuredClone(discoveryFixture);
+  nativeResponse.properties[0].data[0].controls.push(rangeControl(nativeResponse.properties[0].data[0], 'control:position'));
   const originalFetch = global.fetch;
   global.fetch = async (url) => {
     calls.push(String(url));
@@ -31,8 +43,54 @@ test('Alexa discovery uses the native Dinodia OS projection when available', asy
     assert.equal(endpoints[0].friendlyName, discoveryFixture.properties[0].data[0].friendlyName);
     assert.ok(endpoints[0].capabilities.some((capability) => capability.interface === 'Alexa.PowerController'));
     assert.ok(endpoints[0].capabilities.some((capability) => capability.interface === 'Alexa.BrightnessController'));
+    for (const endpoint of endpoints) {
+      assert.ok(endpoint.capabilities.length > 0);
+      for (const capability of endpoint.capabilities) {
+        assert.equal(capability.type, 'AlexaInterface', `capability ${capability.interface} declares its wire type`);
+        assert.equal(typeof capability.interface, 'string');
+        assert.equal(capability.version, '3');
+      }
+      assert.equal(endpoint.capabilities.some((capability) => /LockController|SecurityPanel/i.test(capability.interface)), false,
+        'app-only lock/security controls are never advertised');
+    }
+    const range = endpoints.flatMap((endpoint) => endpoint.capabilities).find((capability) => capability.interface === 'Alexa.RangeController');
+    if (range) {
+      assert.equal(range.instance, 'Dinodia.Position');
+      assert.equal(typeof range.capabilityResources?.friendlyNames?.[0]?.value?.text, 'string');
+      assert.ok(Number.isFinite(range.configuration?.supportedRange?.minimumValue));
+      assert.ok(Number.isFinite(range.configuration?.supportedRange?.maximumValue));
+      assert.ok(Number.isFinite(range.configuration?.supportedRange?.precision));
+      assert.equal(range.configuration.unitOfMeasure, 'Alexa.Unit.Percent');
+      assert.equal(Object.hasOwn(range, 'unitOfMeasure'), false, 'unit is nested under RangeController configuration');
+    }
     assert.equal(JSON.stringify(result).includes(discoveryFixture.properties[0].data[0].id), false);
     assert.equal(calls[0], 'https://dinodia-platform-v2.vercel.app/api/v2/alexa/discovery');
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('Alexa discovery gives same-interface range controls distinct stable instances', async () => {
+  const calls = [];
+  const fixture = structuredClone(discoveryFixture);
+  const device = fixture.properties[0].data[0];
+  const primary = rangeControl(device, 'control:position');
+  device.controls.push(primary);
+  const duplicate = { ...primary, controlId: `${primary.controlId}:second`, label: 'Second position', sortOrder: primary.sortOrder + 1 };
+  device.controls.push(duplicate);
+  const originalFetch = global.fetch;
+  global.fetch = async (url) => {
+    calls.push(String(url));
+    return new Response(JSON.stringify(fixture), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  try {
+    const result = await handler(directive('Alexa.Discovery', 'Discover'));
+    const endpoint = result.event.payload.endpoints.find((item) => item.endpointId === device.endpointId);
+    const ranges = endpoint.capabilities.filter((capability) => capability.interface === 'Alexa.RangeController');
+    assert.equal(ranges.length, 2);
+    assert.equal(new Set(ranges.map((item) => item.instance)).size, 2);
+    assert.ok(ranges.every((item) => item.type === 'AlexaInterface' && item.configuration?.supportedRange));
+    assert.deepEqual(calls, ['https://dinodia-platform-v2.vercel.app/api/v2/alexa/discovery']);
   } finally {
     global.fetch = originalFetch;
   }
@@ -70,6 +128,51 @@ test('dos_ directives are forwarded to native Dinodia OS routing', async () => {
     assert.deepEqual(result, nativeResponse);
     assert.equal(calls[0].url, 'https://dinodia-platform-v2.vercel.app/api/v2/alexa/directives');
     assert.equal(JSON.parse(calls[0].options.body).directive.endpoint.endpointId, endpointId);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('RangeController header instance is forwarded unchanged to the canonical Platform route', async () => {
+  const endpointId = 'dos_' + 'd'.repeat(64);
+  const event = directive('Alexa.RangeController', 'SetRangeValue', endpointId);
+  event.directive.header.instance = 'Dinodia.Position';
+  event.directive.payload = { rangeValue: 50 };
+  const calls = [];
+  const nativeResponse = { event: { header: { namespace: 'Alexa', name: 'Response', payloadVersion: '3' }, endpoint: { endpointId }, payload: {} } };
+  const originalFetch = global.fetch;
+  global.fetch = async (url, options) => {
+    calls.push({ url: String(url), options });
+    return new Response(JSON.stringify(nativeResponse), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  try {
+    const result = await handler(event);
+    const forwarded = JSON.parse(calls[0].options.body).directive;
+    assert.deepEqual(result, nativeResponse);
+    assert.equal(calls[0].url, 'https://dinodia-platform-v2.vercel.app/api/v2/alexa/directives');
+    assert.equal(forwarded.header.instance, 'Dinodia.Position');
+    assert.deepEqual(forwarded.payload, { rangeValue: 50 });
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('successful ReportState result is forwarded as the Platform StateReport unchanged', async () => {
+  const endpointId = 'dos_' + 'e'.repeat(64);
+  const event = directive('Alexa', 'ReportState', endpointId);
+  event.directive.header.correlationToken = 'correlation-state-report';
+  const stateReport = { event: { header: { namespace: 'Alexa', name: 'StateReport', correlationToken: 'correlation-state-report', payloadVersion: '3' }, endpoint: { endpointId }, payload: {} }, context: { properties: [] } };
+  const calls = [];
+  const originalFetch = global.fetch;
+  global.fetch = async (url, options) => {
+    calls.push({ url: String(url), options });
+    return new Response(JSON.stringify(stateReport), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  try {
+    const result = await handler(event);
+    assert.deepEqual(result, stateReport);
+    assert.equal(calls[0].url, 'https://dinodia-platform-v2.vercel.app/api/v2/alexa/report-state');
+    assert.equal(JSON.parse(calls[0].options.body).directive.header.correlationToken, 'correlation-state-report');
   } finally {
     global.fetch = originalFetch;
   }
