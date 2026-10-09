@@ -1,9 +1,16 @@
-import { createHash } from 'node:crypto';
-
 export interface NativeControlV1 { schemaVersion: number; deviceId: string; surfaceId?: string|null; controlId: string; label: string; group?: string|null; valueType: 'boolean'|'number'|'option'|'text'|'invoke'; interactionKind: string; semanticRole: string; readable: boolean; writable: boolean; automatable: boolean; observable: boolean; idempotency: string; confirmationPolicy: string; riskLevel: string; stepUpPolicy: string; unsupportedReason?: string|null; sortOrder: number; catalogRevision: number; expectedReportingIntervalSeconds?: number; maxStateValiditySeconds?: number; constraints?: { minimum?: number; maximum?: number; step?: number; precision?: number; unit?: string; options?: Array<{ value: unknown; label: string }> } }
 export interface NativeDeviceV1 { id: string; homeId: string; managementClass: 'property_device'|'tenant_device'; ownerMembershipId: string|null; lifecycle: 'commissioning'|'installed'|'view_only'|'retired'; technicalLabel: string; customerLabel: string|null; areaIds: string[]; controls: NativeControlV1[]; descriptorRevision: number }
 export interface NativeAlexaContextV1 { homeId: string; homeMembershipId: string; role: 'OWNER'|'PROPERTY_MANAGER'|'TENANT'; authorisedAreaIds: string[] }
-export interface NativeAlexaDiscoveryV1 { homeId: string; homeMembershipId: string; selectedAreaIds: string[]; exposureGeneration: number; devices: NativeDeviceV1[] }
+export interface NativeAlexaDiscoveredDeviceV1 extends NativeDeviceV1 {
+  endpointId: string;
+  friendlyName: string;
+  propertyPostcode: string;
+  areaName: string;
+  homeMembershipId: string;
+  selectedAreaIds: string[];
+  exposureGeneration: number;
+}
+export interface NativeAlexaDiscoveryV1 { devices: NativeAlexaDiscoveredDeviceV1[] }
 const interactionKinds = new Set(['toggle', 'slider', 'thermostat', 'picker', 'text_input', 'momentary_action', 'read_only']);
 const semanticRoles = new Set(['power','brightness','active_heat_demand','active_heat_production','target_temperature','ambient_temperature','opening_percentage','connectivity','security_lock','lock_state','operating_mode','position','volume','color','state','unknown']);
 const approvedAlexaRoles = new Set(['power','brightness','target_temperature','ambient_temperature','opening_percentage','position','volume']);
@@ -74,7 +81,11 @@ export function decodeNativeAlexaDevices(payload: unknown, context: NativeAlexaC
     if (d.managementClass !== 'tenant_device' && d.managementClass !== 'property_device') return null;
     if (d.controls.some((c) => !c || typeof c !== 'object' || Array.isArray(c) || Object.keys(c).some((key) => !allowedControlKeys.includes(key)) || !validControl(c, d)) || new Set(d.controls.map((control) => control.controlId)).size !== d.controls.length) return null;
     if (!d.areaIds.length || new Set(d.areaIds).size !== d.areaIds.length || !d.areaIds.every((area) => context.authorisedAreaIds.includes(area))) return null;
-    const controls = d.controls.filter((c) => c.automatable && c.writable && c.readable && approvedAlexaRoles.has(c.semanticRole) && !['security_lock','lock_state'].includes(c.semanticRole) && c.interactionKind !== 'momentary_action');
+    const controls = d.controls.filter((c) => {
+      if (!approvedAlexaRoles.has(c.semanticRole) || ['security_lock','lock_state'].includes(c.semanticRole) || c.interactionKind === 'momentary_action') return false;
+      if (c.semanticRole === 'ambient_temperature') return c.readable && c.observable && !c.writable && !c.automatable;
+      return c.automatable && c.writable && c.readable;
+    });
     if (controls.length) projection.push({ ...d, controls });
   }
   return projection;
@@ -82,17 +93,59 @@ export function decodeNativeAlexaDevices(payload: unknown, context: NativeAlexaC
 export function decodeNativeAlexaDiscovery(payload: unknown): NativeAlexaDiscoveryV1 | null {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
   const body = payload as Record<string, unknown>;
-  const membership = body.membership as Record<string, unknown> | null;
-  if (Object.keys(body).some((key) => !['schemaVersion','homeId','membership','selectedAreaIds','exposureGeneration','data'].includes(key)) ||
-      body.schemaVersion !== 'dinodia.v1' || !validOpaqueId(body.homeId) || !membership || Object.keys(membership).some((key) => !['homeMembershipId','role'].includes(key)) ||
-      membership.role !== 'TENANT' || !validOpaqueId(membership.homeMembershipId) || !Array.isArray(body.selectedAreaIds) || body.selectedAreaIds.some((id) => !validOpaqueId(id)) || new Set(body.selectedAreaIds).size !== body.selectedAreaIds.length || !Number.isSafeInteger(body.exposureGeneration) || Number(body.exposureGeneration) < 0 || !Array.isArray(body.data)) return null;
-  const context: NativeAlexaContextV1 = { homeId: body.homeId, homeMembershipId: membership.homeMembershipId, role: 'TENANT', authorisedAreaIds: body.selectedAreaIds as string[] };
-  const devices = projectNativeAlexaDevices(body.data, context);
-  if (!devices) return null;
-  return { homeId: body.homeId, homeMembershipId: membership.homeMembershipId, selectedAreaIds: [...body.selectedAreaIds] as string[], exposureGeneration: Number(body.exposureGeneration), devices };
+  if (Object.keys(body).some((key) => !['schemaVersion','properties'].includes(key))
+      || body.schemaVersion !== 'dinodia.v1' || !Array.isArray(body.properties) || body.properties.length > 100) return null;
+  const seenEndpointIds = new Set<string>();
+  const seenHomeMemberships = new Set<string>();
+  const devices: NativeAlexaDiscoveredDeviceV1[] = [];
+  for (const propertyValue of body.properties) {
+    if (!propertyValue || typeof propertyValue !== 'object' || Array.isArray(propertyValue)) return null;
+    const property = propertyValue as Record<string, unknown>;
+    const membership = property.membership as Record<string, unknown> | null;
+    if (Object.keys(property).some((key) => !['homeId','membership','selectedAreaIds','exposureGeneration','postcode','data'].includes(key))
+        || !validOpaqueId(property.homeId) || typeof property.postcode !== 'string' || codePointLength(property.postcode) > 20
+        || !membership || Object.keys(membership).some((key) => !['homeMembershipId','role'].includes(key))
+        || membership.role !== 'TENANT' || !validOpaqueId(membership.homeMembershipId)
+        || !Array.isArray(property.selectedAreaIds) || property.selectedAreaIds.length === 0
+        || property.selectedAreaIds.some((id) => !validOpaqueId(id)) || new Set(property.selectedAreaIds).size !== property.selectedAreaIds.length
+        || !Number.isSafeInteger(property.exposureGeneration) || Number(property.exposureGeneration) < 1
+        || !Array.isArray(property.data) || property.data.length > 512) return null;
+    if (seenHomeMemberships.has(membership.homeMembershipId)) return null;
+    const homeMembershipId = membership.homeMembershipId as string;
+    const selectedAreaIds = property.selectedAreaIds as string[];
+    const propertyPostcode = property.postcode as string;
+    seenHomeMemberships.add(homeMembershipId);
+    const context: NativeAlexaContextV1 = { homeId: property.homeId, homeMembershipId, role: 'TENANT', authorisedAreaIds: selectedAreaIds };
+    const endpointIdsByDevice = new Map<string, { endpointId: string; friendlyName: string; areaName: string }>();
+    const deviceRows: unknown[] = [];
+    for (const item of property.data) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
+      const row = item as Record<string, unknown>;
+      if (Object.keys(row).some((key) => !['endpointId','friendlyName','propertyPostcode','areaName','id','homeId','managementClass','ownerMembershipId','lifecycle','technicalLabel','customerLabel','areaIds','controls','descriptorRevision'].includes(key))
+          || typeof row.endpointId !== 'string' || !/^dos_[A-Za-z0-9_-]{16,80}$/.test(row.endpointId)
+          || seenEndpointIds.has(row.endpointId) || typeof row.id !== 'string' || typeof row.friendlyName !== 'string'
+          || !row.friendlyName.trim() || codePointLength(row.friendlyName) > 160 || row.propertyPostcode !== property.postcode
+          || typeof row.areaName !== 'string' || codePointLength(row.areaName) > 160) return null;
+      seenEndpointIds.add(row.endpointId);
+      endpointIdsByDevice.set(row.id, { endpointId: row.endpointId, friendlyName: row.friendlyName, areaName: row.areaName });
+      const { endpointId: _endpointId, friendlyName: _friendlyName, propertyPostcode: _postcode, areaName: _areaName, ...device } = row;
+      void _endpointId; void _friendlyName; void _postcode; void _areaName;
+      deviceRows.push(device);
+    }
+    const projected = projectNativeAlexaDevices(deviceRows, context);
+    if (!projected) return null;
+    const propertyDevices = projected.flatMap((device) => {
+      const presentation = endpointIdsByDevice.get(device.id);
+      return presentation ? [{ ...device, ...presentation, propertyPostcode,
+        homeMembershipId, selectedAreaIds: [...selectedAreaIds],
+        exposureGeneration: Number(property.exposureGeneration) }] : [];
+    });
+    if (propertyDevices.length !== projected.length) return null;
+    devices.push(...propertyDevices);
+  }
+  return { devices };
 }
 function projectNativeAlexaDevices(data: unknown[], context: NativeAlexaContextV1): NativeDeviceV1[] | null {
   const payload = { schemaVersion: 'dinodia.v1', homeId: context.homeId, streamId: 'alexa-discovery', sequence: 0, generatedAt: new Date().toISOString(), revision: 0, data };
   return decodeNativeAlexaDevices(payload, context);
 }
-export function alexaEndpointId(homeId: string, deviceId: string): string { return `dos_${createHash('sha256').update(homeId).update('\0').update(deviceId).digest('hex')}`; }

@@ -4,7 +4,6 @@ const assert = require('node:assert/strict');
 process.env.DINODIA_API_BASE_URL = 'https://dinodia-platform-v2.vercel.app';
 const { handler } = require('../dist/index.js');
 const discoveryFixture = require('./fixtures/dinodia-v1/fixtures/alexa-discovery-projection.json');
-const { alexaEndpointId } = require('../dist/dinodiaV1.js');
 
 function directive(namespace, name, endpointId) {
   return {
@@ -27,12 +26,31 @@ test('Alexa discovery uses the native Dinodia OS projection when available', asy
   try {
     const result = await handler(directive('Alexa.Discovery', 'Discover'));
     const endpoints = result.event.payload.endpoints;
-    assert.equal(endpoints.length, 1);
-    assert.equal(endpoints[0].endpointId, alexaEndpointId(discoveryFixture.homeId, discoveryFixture.data[0].id));
+    assert.equal(endpoints.length, 2);
+    assert.equal(endpoints[0].endpointId, discoveryFixture.properties[0].data[0].endpointId, 'the skill forwards the Platform-owned ID unchanged');
+    assert.equal(endpoints[0].friendlyName, discoveryFixture.properties[0].data[0].friendlyName);
     assert.ok(endpoints[0].capabilities.some((capability) => capability.interface === 'Alexa.PowerController'));
     assert.ok(endpoints[0].capabilities.some((capability) => capability.interface === 'Alexa.BrightnessController'));
-    assert.equal(JSON.stringify(result).includes(discoveryFixture.data[0].id), false);
+    assert.equal(JSON.stringify(result).includes(discoveryFixture.properties[0].data[0].id), false);
     assert.equal(calls[0], 'https://dinodia-platform-v2.vercel.app/api/v2/alexa/discovery');
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('Alexa discovery fails closed when Platform omits its endpoint identity', async () => {
+  const calls = [];
+  const originalFetch = global.fetch;
+  const { properties, ...nativeResponse } = discoveryFixture;
+  global.fetch = async (url) => {
+    calls.push(String(url));
+    const body = { ...nativeResponse, properties: properties.map((property) => ({ ...property, data: property.data.map(({ endpointId, ...device }) => device) })) };
+    return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  try {
+    const result = await handler(directive('Alexa.Discovery', 'Discover'));
+    assert.equal(result.event.payload.type, 'ENDPOINT_UNREACHABLE');
+    assert.deepEqual(calls, ['https://dinodia-platform-v2.vercel.app/api/v2/alexa/discovery']);
   } finally {
     global.fetch = originalFetch;
   }
@@ -75,7 +93,7 @@ test('native discovery failure is returned without falling back to the legacy de
   } finally { global.fetch = originalFetch; }
 });
 
-test('Stage 2 feature-disabled discovery and directives are truthful and never reach legacy routes', async () => {
+test('global Alexa activation hold is truthful and never reaches legacy routes', async () => {
   const calls = [];
   const originalFetch = global.fetch;
   global.fetch = async (url) => { calls.push(String(url)); return new Response('{"error":"feature_disabled"}', { status: 501 }); };
@@ -91,19 +109,34 @@ test('Stage 2 feature-disabled discovery and directives are truthful and never r
   } finally { global.fetch = originalFetch; }
 });
 
-test('Stage 12 AcceptGrant, skill events and proactive queue delivery remain inert', async () => {
+test('AcceptGrant sends its bounded code and linked Dinodia token to canonical Platform', async () => {
   const calls = [];
   const originalFetch = global.fetch;
-  global.fetch = async (url) => { calls.push(String(url)); return new Response('{}', { status: 200 }); };
+  global.fetch = async (url, options) => { calls.push({ url: String(url), options }); return new Response('{"accepted":true}', { status: 200 }); };
   try {
-    const accepted = await handler({ directive: { header: { namespace: 'Alexa.Authorization', name: 'AcceptGrant', messageId: 'grant-test', payloadVersion: '3' }, payload: { grant: { code: 'test-only' }, grantee: { token: 'test-only' } } } });
+    const accepted = await handler({ directive: { header: { namespace: 'Alexa.Authorization', name: 'AcceptGrant', messageId: 'grant-test', payloadVersion: '3' }, payload: { grant: { type: 'OAuth2.AuthorizationCode', code: 'disposable-code' }, grantee: { type: 'BearerToken', token: 'dno-customer-access-123456789012345678901234567890' } } } });
     assert.equal(accepted.event.header.namespace, 'Alexa.Authorization');
-    assert.equal(accepted.event.header.name, 'AuthorizationError');
-    const skillEvent = await handler({ request: { type: 'AlexaSkillEvent.SkillAccountLinked', body: { accessToken: 'test-only' } } });
-    assert.deepEqual(skillEvent, {});
+    assert.equal(accepted.event.header.name, 'AcceptGrant.Response');
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, 'https://dinodia-platform-v2.vercel.app/api/v2/alexa/accept-grant');
+    assert.equal(calls[0].options.headers.authorization, 'Bearer dno-customer-access-123456789012345678901234567890');
+    assert.deepEqual(JSON.parse(calls[0].options.body), { messageId: 'grant-test', grantCode: 'disposable-code' });
     const queueEvent = await handler({ Records: [{ eventSource: 'aws:sqs', body: '{"testOnly":true}' }] });
     assert.equal(queueEvent, undefined);
-    assert.deepEqual(calls, []);
+  } finally { global.fetch = originalFetch; }
+});
+
+test('AcceptGrant fails closed when provider exchange is unavailable or malformed', async () => {
+  const originalFetch = global.fetch;
+  let calls = 0;
+  global.fetch = async () => { calls += 1; return new Response('{"error":"unavailable"}', { status: 503 }); };
+  try {
+    const failed = await handler({ directive: { header: { namespace: 'Alexa.Authorization', name: 'AcceptGrant', messageId: 'grant-failure', payloadVersion: '3' }, payload: { grant: { type: 'OAuth2.AuthorizationCode', code: 'valid-shaped-code' }, grantee: { type: 'BearerToken', token: 'dno-customer-access-123456789012345678901234567890' } } } });
+    assert.equal(failed.event.header.name, 'ErrorResponse');
+    assert.equal(failed.event.payload.type, 'ACCEPT_GRANT_FAILED');
+    const malformed = await handler({ directive: { header: { namespace: 'Alexa.Authorization', name: 'AcceptGrant', messageId: 'grant-invalid', payloadVersion: '3' }, payload: { grant: { code: 'missing-type' }, grantee: { type: 'BearerToken', token: 'dno-customer-access-123456789012345678901234567890' } } } });
+    assert.equal(malformed.event.payload.type, 'ACCEPT_GRANT_FAILED');
+    assert.equal(calls, 1, 'malformed grant did not reach Platform');
   } finally { global.fetch = originalFetch; }
 });
 

@@ -38,7 +38,7 @@ try {
   if (!statSync(temporaryPath).isFile()) throw new Error('ZIP tool did not produce a regular file');
   renameSync(temporaryPath, outputPath);
 } catch (error) {
-  throw new Error(`Could not create deterministic Stage 2 Lambda package: ${error instanceof Error ? error.message : 'zip failed'}`);
+  throw new Error(`Could not create deterministic Native V2 Lambda package: ${error instanceof Error ? error.message : 'zip failed'}`);
 }
 
 const digest = createHash('sha256').update(await import('node:fs/promises').then(({ readFile }) => readFile(outputPath))).digest('hex');
