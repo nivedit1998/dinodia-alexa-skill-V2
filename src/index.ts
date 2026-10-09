@@ -58,7 +58,7 @@ function supportedInterfaces(device: NativeAlexaDiscoveredDeviceV1): object[] {
     result.push({ type: 'AlexaInterface', interface: 'Alexa.BrightnessController', version: '3', properties: { proactivelyReported: true, retrievable: true, supported: [{ name: 'brightness' }] } });
   }
   if (controls.some((control) => control.semanticRole === 'target_temperature' && control.valueType === 'number')) {
-    result.push({ type: 'AlexaInterface', interface: 'Alexa.ThermostatController', version: '3', properties: { proactivelyReported: true, retrievable: true, supported: [{ name: 'targetSetpoint' }] }, configuration: { supportedModes: [{ value: 'HEAT' }] } });
+    result.push({ type: 'AlexaInterface', interface: 'Alexa.ThermostatController', version: '3', properties: { proactivelyReported: true, retrievable: true, supported: [{ name: 'targetSetpoint' }] } });
   }
   if (device.controls.some((control) => control.semanticRole === 'ambient_temperature' && control.readable && control.observable && !control.writable)) {
     result.push({ type: 'AlexaInterface', interface: 'Alexa.TemperatureSensor', version: '3', properties: { proactivelyReported: true, retrievable: true, supported: [{ name: 'temperature' }] } });
@@ -81,6 +81,15 @@ function supportedInterfaces(device: NativeAlexaDiscoveredDeviceV1): object[] {
   }
   return result;
 }
+
+function displayCategories(device: NativeAlexaDiscoveredDeviceV1): string[] {
+  const roles = new Set(device.controls.map((control) => control.semanticRole));
+  const categories: string[] = [];
+  if (roles.has('target_temperature')) categories.push('THERMOSTAT');
+  if (roles.has('ambient_temperature')) categories.push('TEMPERATURE_SENSOR');
+  if (roles.has('power') || roles.has('brightness')) categories.push('LIGHT');
+  return categories.length ? categories : ['OTHER'];
+}
 function validRange(control: NativeControlV1): boolean {
   const bounds = control.constraints;
   return !!bounds && Number.isFinite(bounds.minimum) && Number.isFinite(bounds.maximum) && Number.isFinite(bounds.step) && Number(bounds.step) > 0 && Number(bounds.minimum) <= Number(bounds.maximum);
@@ -97,7 +106,7 @@ async function fetchNativeDiscovery(accessToken: string): Promise<object> {
   const endpoints = projection.devices.flatMap((device) => {
     const capabilities = supportedInterfaces(device);
     if (capabilities.length === 1) return [];
-    return [{ endpointId: device.endpointId, manufacturerName: 'Dinodia', friendlyName: device.friendlyName, description: 'Dinodia Smart Living device', displayCategories: ['OTHER'], capabilities }];
+    return [{ endpointId: device.endpointId, manufacturerName: 'Dinodia', friendlyName: device.friendlyName, description: 'Dinodia Smart Living device', displayCategories: displayCategories(device), capabilities }];
   });
   return { event: { header: { namespace: 'Alexa.Discovery', name: 'Discover.Response', messageId: newMessageId(), payloadVersion: '3' }, payload: { endpoints } } };
 }

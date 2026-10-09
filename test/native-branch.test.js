@@ -46,9 +46,24 @@ test('Alexa discovery uses the native Dinodia OS projection when available', asy
     for (const endpoint of endpoints) {
       assert.ok(endpoint.capabilities.length > 0);
       for (const capability of endpoint.capabilities) {
-        assert.equal(capability.type, 'AlexaInterface', `capability ${capability.interface} declares its wire type`);
-        assert.equal(typeof capability.interface, 'string');
-        assert.equal(capability.version, '3');
+      assert.equal(capability.type, 'AlexaInterface', `capability ${capability.interface} declares its wire type`);
+      assert.equal(typeof capability.interface, 'string');
+      assert.equal(capability.version, '3');
+      if (capability.interface === 'Alexa.EndpointHealth') assert.deepEqual(capability.properties?.supported, [{ name: 'connectivity' }]);
+      if (capability.interface === 'Alexa.PowerController') assert.deepEqual(capability.properties?.supported, [{ name: 'powerState' }]);
+      if (capability.interface === 'Alexa.BrightnessController') assert.deepEqual(capability.properties?.supported, [{ name: 'brightness' }]);
+      if (capability.interface === 'Alexa.ThermostatController') {
+        assert.deepEqual(capability.properties?.supported, [{ name: 'targetSetpoint' }]);
+        assert.equal(Object.hasOwn(capability, 'configuration'), false, 'setpoint-only V3 does not emit unsupported mode configuration');
+      }
+      if (capability.interface === 'Alexa.TemperatureSensor') assert.deepEqual(capability.properties?.supported, [{ name: 'temperature' }]);
+      if (capability.interface === 'Alexa.RangeController') {
+        assert.equal(typeof capability.instance, 'string');
+        assert.deepEqual(capability.properties?.supported, [{ name: 'rangeValue' }]);
+        assert.ok(Number.isFinite(capability.configuration?.supportedRange?.precision));
+        assert.ok(Number.isFinite(capability.configuration?.supportedRange?.minimumValue));
+        assert.ok(Number.isFinite(capability.configuration?.supportedRange?.maximumValue));
+      }
       }
       assert.equal(endpoint.capabilities.some((capability) => /LockController|SecurityPanel/i.test(capability.interface)), false,
         'app-only lock/security controls are never advertised');
@@ -94,6 +109,51 @@ test('Alexa discovery gives same-interface range controls distinct stable instan
   } finally {
     global.fetch = originalFetch;
   }
+});
+
+test('packaged discovery emits provider-valid setpoint-only thermostat and temperature-sensor wire shapes', async () => {
+  const fixture = structuredClone(discoveryFixture);
+  const thermostat = fixture.properties[0].data[0];
+  thermostat.controls = [{
+    schemaVersion: 1, deviceId: thermostat.id, controlId: 'control:target-temperature', label: 'Target temperature', sortOrder: 0,
+    valueType: 'number', interactionKind: 'slider', semanticRole: 'target_temperature', readable: true, writable: true,
+    automatable: true, observable: true, idempotency: 'set_value', confirmationPolicy: 'matching_observation',
+    riskLevel: 'normal', stepUpPolicy: 'none', constraints: { minimum: 5, maximum: 35, step: 0.5, unit: 'celsius' },
+    catalogRevision: thermostat.descriptorRevision, expectedReportingIntervalSeconds: 60, maxStateValiditySeconds: 180,
+  }];
+  const sensor = structuredClone(fixture.properties[0].data[1]);
+  sensor.id = 'device:temperature-sensor-only';
+  sensor.endpointId = 'dos_' + 'c'.repeat(64);
+  sensor.controls = [{
+    schemaVersion: 1, deviceId: sensor.id, controlId: 'control:ambient-temperature', label: 'Temperature', sortOrder: 0,
+    valueType: 'number', interactionKind: 'read_only', semanticRole: 'ambient_temperature', readable: true, writable: false,
+    automatable: false, observable: true, idempotency: 'none', confirmationPolicy: 'none',
+    riskLevel: 'low', stepUpPolicy: 'none', constraints: { minimum: -40, maximum: 100, step: 0.1, unit: 'celsius' },
+    catalogRevision: sensor.descriptorRevision, expectedReportingIntervalSeconds: 60, maxStateValiditySeconds: 180,
+  }];
+  fixture.properties[0].data = [thermostat, sensor];
+  const originalFetch = global.fetch;
+  global.fetch = async () => new Response(JSON.stringify(fixture), { status: 200, headers: { 'content-type': 'application/json' } });
+  try {
+    const result = await handler(directive('Alexa.Discovery', 'Discover'));
+    const thermostatEndpoint = result.event.payload.endpoints.find((item) => item.endpointId === thermostat.endpointId);
+    const thermostatCapability = thermostatEndpoint.capabilities.find((item) => item.interface === 'Alexa.ThermostatController');
+    assert.deepEqual(thermostatEndpoint.displayCategories, ['THERMOSTAT']);
+    assert.deepEqual(thermostatCapability.properties.supported, [{ name: 'targetSetpoint' }]);
+    assert.equal(Object.hasOwn(thermostatCapability, 'configuration'), false, 'setpoint-only device does not advertise invented mode support');
+    const sensorEndpoint = result.event.payload.endpoints.find((item) => item.endpointId === sensor.endpointId);
+    assert.deepEqual(sensorEndpoint.displayCategories, ['TEMPERATURE_SENSOR']);
+    assert.ok(sensorEndpoint.capabilities.some((item) => item.interface === 'Alexa.TemperatureSensor'
+      && item.properties.supported.some((property) => property.name === 'temperature')));
+    assert.equal(sensorEndpoint.capabilities.some((item) => item.interface === 'Alexa.ThermostatController'), false);
+    for (const endpoint of result.event.payload.endpoints) {
+      for (const capability of endpoint.capabilities) {
+        assert.equal(capability.type, 'AlexaInterface');
+        assert.equal(typeof capability.version, 'string');
+        assert.ok(capability.properties === undefined || Array.isArray(capability.properties.supported));
+      }
+    }
+  } finally { global.fetch = originalFetch; }
 });
 
 test('Alexa discovery fails closed when Platform omits its endpoint identity', async () => {
