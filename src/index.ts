@@ -26,6 +26,10 @@ class AlexaAuthError extends Error {}
 class NativeAlexaUnavailableError extends Error {}
 
 function newMessageId(): string { return `dinodia-${randomUUID()}`; }
+/** One structured line per request for CloudWatch. Only fixed, non-secret fields are ever logged. */
+function logEvent(event: string, fields: Record<string, string | number | boolean | undefined>): void {
+  try { console.log(JSON.stringify({ app: 'dinodia-alexa', event, ...fields })); } catch { /* logging must never affect Alexa */ }
+}
 function accessTokenFrom(directive: AlexaDirective): string {
   const value = directive.endpoint?.scope?.token ?? directive.payload?.scope?.token;
   return typeof value === 'string' ? value.trim() : '';
@@ -95,13 +99,48 @@ function validRange(control: NativeControlV1): boolean {
   return !!bounds && Number.isFinite(bounds.minimum) && Number.isFinite(bounds.maximum) && Number.isFinite(bounds.step) && Number(bounds.step) > 0 && Number(bounds.minimum) <= Number(bounds.maximum);
 }
 
+const MAX_DISCOVERY_ENDPOINTS = 300;
+const MAX_ENDPOINT_BYTES = 24 * 1024;
+/** Accepts only well-formed Dinodia endpoints; anything unexpected rejects the whole response rather than reaching Alexa. */
+function passThroughEndpoints(body: unknown): object[] | null {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
+  const record = body as Record<string, unknown>;
+  if (record.schemaVersion !== 'dinodia.v1' || !Array.isArray(record.endpoints)) return null;
+  const seen = new Set<string>();
+  const endpoints: object[] = [];
+  for (const value of record.endpoints) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Platform returned an invalid Alexa endpoint');
+    const endpoint = value as Record<string, unknown>;
+    if (!isNativeEndpointId(endpoint.endpointId) || seen.has(endpoint.endpointId)
+      || endpoint.manufacturerName !== 'Dinodia'
+      || typeof endpoint.friendlyName !== 'string' || !endpoint.friendlyName.trim() || endpoint.friendlyName.length > 128
+      || typeof endpoint.description !== 'string' || endpoint.description.length > 128
+      || !Array.isArray(endpoint.displayCategories) || endpoint.displayCategories.length < 1 || endpoint.displayCategories.some((item) => typeof item !== 'string')
+      || !Array.isArray(endpoint.capabilities) || endpoint.capabilities.length < 2
+      || endpoint.capabilities.some((capability) => !capability || typeof capability !== 'object' || (capability as Record<string, unknown>).type !== 'AlexaInterface')
+      || JSON.stringify(endpoint).length > MAX_ENDPOINT_BYTES) throw new Error('Platform returned an invalid Alexa endpoint');
+    seen.add(endpoint.endpointId);
+    endpoints.push(endpoint);
+  }
+  // Alexa accepts at most 300 endpoints in one discovery response; Platform announces the rest as it changes.
+  return endpoints.slice(0, MAX_DISCOVERY_ENDPOINTS);
+}
+
 async function fetchNativeDiscovery(accessToken: string): Promise<object> {
   if (!DINODIA_API_BASE_URL) throw new Error('DINODIA_API_BASE_URL is not configured');
   const response = await fetch(`${DINODIA_API_BASE_URL}/api/v2/alexa/discovery`, { headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' } });
   if (response.status === 401 || response.status === 403) throw new AlexaAuthError('Alexa authorization failed');
   if (response.status === 501) throw new NativeAlexaUnavailableError('Native Alexa discovery is not activated');
   if (!response.ok) throw new Error(`Native Alexa discovery failed (${response.status})`);
-  const projection = decodeNativeAlexaDiscovery(await response.json());
+  const body: unknown = await response.json();
+  // Current Platform returns Alexa-ready endpoints (names, categories and capabilities decided in one place). Older
+  // Platform builds return the device projection that is converted below; both stay supported.
+  const readyEndpoints = passThroughEndpoints(body);
+  if (readyEndpoints) {
+    logEvent('discovery', { status: response.status, endpointCount: readyEndpoints.length, mode: 'platform-endpoints' });
+    return { event: { header: { namespace: 'Alexa.Discovery', name: 'Discover.Response', messageId: newMessageId(), payloadVersion: '3' }, payload: { endpoints: readyEndpoints } } };
+  }
+  const projection = decodeNativeAlexaDiscovery(body);
   if (!projection) throw new Error('Platform returned an invalid dinodia.v1 Alexa projection');
   const endpoints = projection.devices.flatMap((device) => {
     const capabilities = supportedInterfaces(device);
@@ -121,9 +160,13 @@ async function forwardNativeDirective(directive: AlexaDirective, accessToken: st
   });
   if (response.status === 401 || response.status === 403) throw new AlexaAuthError('Alexa authorization failed');
   if (response.status === 501) throw new NativeAlexaUnavailableError('Native Alexa directives are not activated');
-  if (!response.ok) throw new Error(`Native Alexa directive failed (${response.status})`);
+  if (!response.ok) {
+    logEvent('directive_failed', { namespace: directive.header.namespace, name: directive.header.name, status: response.status, endpointId: directive.endpoint?.endpointId });
+    throw new Error(`Native Alexa directive failed (${response.status})`);
+  }
   const body: unknown = await response.json().catch(() => null);
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('Platform returned an invalid Alexa response');
+  logEvent('directive', { namespace: directive.header.namespace, name: directive.header.name, status: response.status, endpointId: directive.endpoint?.endpointId });
   return body;
 }
 

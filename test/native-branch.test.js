@@ -313,3 +313,49 @@ test('legacy ha_ endpoint IDs are rejected without contacting a backend', async 
     assert.ok(result.event);
   } finally { global.fetch = originalFetch; }
 });
+
+function readyEndpoint(overrides = {}) {
+  return {
+    endpointId: 'dos_abcdefghijklmnop1234', manufacturerName: 'Dinodia', friendlyName: 'Bedroom lamp',
+    description: 'Dinodia Smart Living device', displayCategories: ['LIGHT'],
+    capabilities: [
+      { type: 'AlexaInterface', interface: 'Alexa', version: '3' },
+      { type: 'AlexaInterface', interface: 'Alexa.PowerController', version: '3', properties: { supported: [{ name: 'powerState' }], proactivelyReported: true, retrievable: true } },
+    ],
+    ...overrides,
+  };
+}
+
+async function discoverWith(body) {
+  const originalFetch = global.fetch;
+  global.fetch = async () => new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+  try { return await handler(directive('Alexa.Discovery', 'Discover')); }
+  finally { global.fetch = originalFetch; }
+}
+
+test('Alexa discovery passes Platform-built endpoints through unchanged', async () => {
+  const endpoint = readyEndpoint();
+  const result = await discoverWith({ schemaVersion: 'dinodia.v1', properties: [], endpoints: [endpoint] });
+  assert.equal(result.event.header.name, 'Discover.Response');
+  assert.deepEqual(result.event.payload.endpoints, [endpoint]);
+});
+
+test('Alexa discovery rejects malformed or duplicate Platform endpoints instead of forwarding them', async () => {
+  for (const endpoints of [
+    [readyEndpoint({ manufacturerName: 'Other' })],
+    [readyEndpoint({ endpointId: 'not-native' })],
+    [readyEndpoint({ friendlyName: '' })],
+    [readyEndpoint({ capabilities: [{ type: 'AlexaInterface', interface: 'Alexa', version: '3' }] })],
+    [readyEndpoint(), readyEndpoint()],
+  ]) {
+    const result = await discoverWith({ schemaVersion: 'dinodia.v1', properties: [], endpoints });
+    assert.equal(result.event.header.name, 'ErrorResponse');
+    assert.equal(result.event.payload.type, 'ENDPOINT_UNREACHABLE');
+  }
+});
+
+test('Alexa discovery returns at most 300 endpoints in one response', async () => {
+  const endpoints = Array.from({ length: 320 }, (_, index) => readyEndpoint({ endpointId: `dos_${String(index).padStart(20, '0')}`, friendlyName: `Lamp ${index}` }));
+  const result = await discoverWith({ schemaVersion: 'dinodia.v1', properties: [], endpoints });
+  assert.equal(result.event.payload.endpoints.length, 300);
+});
